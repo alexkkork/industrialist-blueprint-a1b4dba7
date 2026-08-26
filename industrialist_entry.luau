@@ -27,6 +27,8 @@ local REQUIRED_MAIN_VERSION = "2.0.0-production"
 local REQUIRED_CONTRACT_VERSION = "guided-entry-v2"
 local REQUIRED_CAPTURE_HOOK_VERSION = "post-call-placement-v6"
 local DEFAULT_LOCAL_PATH = "industrialist_blueprint_placer.luau"
+local DEFAULT_MAIN_URL = "https://raw.githubusercontent.com/alexkkork/industrialist-blueprint-a1b4dba7/d45d3a4abb203dee592c3f692285394433b94175/industrialist_blueprint_placer.luau"
+local DEFAULT_MAIN_SHA256 = "e0cf4ebc03dd94768153b1c05ce8636d13ab0336b5b142b776200c586f7f5fba"
 local MAX_MAIN_BYTES = math.clamp(tonumber(entryConfiguration.MaxMainBytes) or 1500000, 100000, 5000000)
 local MAIN_MARKER = "Industrialist Blueprint Placer"
 local GUI_NAME = "__IndustrialistGuidedSetup"
@@ -787,7 +789,7 @@ local function immutableURL(url, expectedHash)
 	return commit ~= nil and (#commit == 40 or #commit == 64)
 end
 
-local function validateMainSource(source, origin)
+local function validateMainSource(source, origin, expectedHashOverride)
 	if type(source) ~= "string" then
 		return false, origin .. " did not return text."
 	elseif #source < 1000 then
@@ -797,7 +799,10 @@ local function validateMainSource(source, origin)
 	elseif not source:find(MAIN_MARKER, 1, true) then
 		return false, origin .. " is missing the Industrialist main-script marker."
 	end
-	local expectedHash = normalizedHash(entryConfiguration.ExpectedMainSHA256)
+	local expectedHash = normalizedHash(
+		expectedHashOverride ~= nil and expectedHashOverride
+			or entryConfiguration.ExpectedMainSHA256
+	)
 	if expectedHash ~= "" then
 		if #expectedHash ~= 64 then
 			return false, "ExpectedMainSHA256 must contain exactly 64 hexadecimal characters."
@@ -851,8 +856,13 @@ local function readMainSource()
 	end
 
 	local url = entryConfiguration.MainURL
+	local expectedRemoteHash = entryConfiguration.ExpectedMainSHA256
+	if type(url) ~= "string" or url == "" then
+		url = DEFAULT_MAIN_URL
+		expectedRemoteHash = DEFAULT_MAIN_SHA256
+	end
 	if type(url) == "string" and url ~= "" then
-		if not immutableURL(url, entryConfiguration.ExpectedMainSHA256) then
+		if not immutableURL(url, expectedRemoteHash) then
 			table.insert(errors, "MainURL must use a full raw.githubusercontent.com commit or an ExpectedMainSHA256.")
 		else
 			LoadingDetail.Text = "Downloading the configured immutable main release..."
@@ -860,7 +870,11 @@ local function readMainSource()
 				return game:HttpGet(url)
 			end)
 			if downloadOK then
-				local valid, validationError = validateMainSource(source, "Downloaded main script")
+				local valid, validationError = validateMainSource(
+					source,
+					"Downloaded main script",
+					expectedRemoteHash
+				)
 				if valid then
 					return source, url
 				end
