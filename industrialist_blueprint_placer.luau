@@ -60,6 +60,11 @@ local Config = {
 	-- window before it can supersede a nonempty decoration-proven registry graph.
 	LiveConnectionEmptyQuietTime = 0.4,
 	DuplicateConnectionAuditBatch = 12,
+	-- Duplicate graph recovery inspects every selected connector family twice for
+	-- stability. Cache each placed model's connector/path inventory so the second
+	-- frame and later Preview/Export/Build audits do not walk detailed models again.
+	ConnectionRecoveryModelYieldEvery = 48,
+	PreviewRenderYieldEvery = 32,
 	-- A fresh bind can reuse an endpoint cap when several short pipe edges share
 	-- one PipeA node. The new segment is the authoritative post-call evidence;
 	-- any matching live cap may complete its visual pair.
@@ -134,6 +139,7 @@ local Config = {
 	AutoPlumbSearchMargin = 56,
 	AutoPlumbBendPenalty = 0.35,
 	AutoPlumbMaxVisited = 18000,
+	AutoPlumbSearchYieldEvery = 384,
 	AutoPlumbMaxEndpointCandidates = 24,
 	AutoPlumbMaxPairAttempts = 16,
 	MaxBlueprintMachines = 1024,
@@ -141,7 +147,7 @@ local Config = {
 	MaxAutoPlumbRoutes = 512,
 	MaxConnections = 8192,
 	MaxConnectorPathSegments = 64,
-	MaxVisibleConnectionPreviewLines = 512,
+	MaxVisibleConnectionPreviewLines = 256,
 	MaxReasonsPerPreview = 8,
 	MaxInvalidPreviewWarnings = 50,
 	MaxDuplicateSelection = 1024,
@@ -191,6 +197,9 @@ local State = {
 	connectionPreviews = {},
 	connectionPreviewDonorCache = {},
 	previewConnectionLinesUsed = 0,
+	previewInProgress = false,
+	previewEpoch = 0,
+	activePreviewEpoch = nil,
 	validated = false,
 	building = false,
 	buildRemoteAttempted = false,
@@ -227,6 +236,8 @@ local State = {
 	autoPlumbGeneratedLinks = 0,
 	knownConnections = {},
 	knownConnectionIndex = { Pipe = {}, Wire = {} },
+	connectionDecorationRegistry = nil,
+	connectionConnectorCache = setmetatable({}, { __mode = "k" }),
 	completeConnectionModels = setmetatable({}, { __mode = "k" }),
 	physicalPlumbingModels = setmetatable({}, { __mode = "k" }),
 	exactTemplateCache = {},
@@ -336,6 +347,7 @@ local State = {
 		exportSerial = 0,
 		lastReportedFailure = nil,
 		connectionAuditInProgress = false,
+		previewInProgress = false,
 	},
 	rayfield = nil,
 	interface = nil,
@@ -1686,6 +1698,7 @@ local function clearPreview()
 		notify("Clear refused", "A blueprint build is currently running.", 6)
 		return false
 	end
+	State.previewEpoch += 1
 	local folder = workspace:FindFirstChild("__IndustrialistBlueprintPreview")
 	if folder and folder:IsA("Folder") then
 		folder:ClearAllChildren()
@@ -2083,6 +2096,18 @@ function Runtime.trackPlacedRegistryObject(registry, object)
 	end
 end
 
+function Runtime.invalidateConnectionConnectorCache(object)
+	local cache = State.connectionConnectorCache
+	local cursor = object
+	while cursor and cursor ~= Plots do
+		if cursor:IsA("Model") and cache[cursor] ~= nil then
+			cache[cursor] = nil
+			return
+		end
+		cursor = cursor.Parent
+	end
+end
+
 function Runtime.releasePlacedRegistry()
 	local registry = State.placedRegistry
 	if not registry then
@@ -2119,12 +2144,14 @@ function Runtime.ensurePlacedRegistry()
 	-- during initialization are therefore seen by either the event or snapshot;
 	-- byModel makes that race idempotent.
 	table.insert(registry.connections, Plots.DescendantAdded:Connect(function(object)
+		Runtime.invalidateConnectionConnectorCache(object)
 		Runtime.trackPlacedRegistryObject(registry, object)
 	end))
 	table.insert(registry.connections, Plots.DescendantRemoving:Connect(function(object)
 		if registry.released or State.placedRegistry ~= registry then
 			return
 		end
+		Runtime.invalidateConnectionConnectorCache(object)
 		if object:IsA("Model") then
 			-- DescendantRemoving is emitted for each nested Model. Remove the direct
 			-- record in O(1); the collection-time validity pass also closes any
@@ -3487,7 +3514,7 @@ local function validatePreviews(existing)
 	return allValid
 end
 
-local function previewAndValidate()
+function Runtime.previewAndValidateCore()
 	if State.destroyed then
 		return false
 	elseif State.autoFitInProgress then
@@ -3498,6 +3525,9 @@ local function previewAndValidate()
 		notify("Preview refused", "A blueprint build is currently running.", 6)
 		return false
 	end
+	State.previewEpoch += 1
+	local previewEpoch = State.previewEpoch
+	State.activePreviewEpoch = previewEpoch
 	local requestedX = State.originX
 	local requestedZ = State.originZ
 	local snappedX, snappedZ, originAdjusted = setBlueprintOrigin(requestedX, requestedZ)
@@ -3526,6 +3556,12 @@ local function previewAndValidate()
 
 	for index, entry in ipairs(Blueprint) do
 		table.insert(State.previews, createPreview(index, entry, folder))
+		if index % Config.PreviewRenderYieldEvery == 0 then
+			RunService.Heartbeat:Wait()
+			if State.destroyed or State.previewEpoch ~= previewEpoch then
+				return false, "Preview was cancelled because its source/settings changed."
+			end
+		end
 	end
 
 	-- Saved physical plumbing is kept for backwards compatibility. New compact
@@ -3540,11 +3576,20 @@ local function previewAndValidate()
 			preview.model.Name = string.format("Plumbing_%02d_%s", index, entry.Name)
 		end
 		table.insert(State.authoredPlacementPreviews, preview)
+		if index % Config.PreviewRenderYieldEvery == 0 then
+			RunService.Heartbeat:Wait()
+			if State.destroyed or State.previewEpoch ~= previewEpoch then
+				return false, "Preview was cancelled because its source/settings changed."
+			end
+		end
 	end
 	local plumbingOK = true
 	local plumbingError = nil
 	if generateAutoPlumbing then
 		plumbingOK, plumbingError = generateAutoPlumbing()
+	end
+	if State.destroyed or State.previewEpoch ~= previewEpoch then
+		return false, "Preview was cancelled because its source/settings changed."
 	end
 	-- generateAutoPlumbing resets the effective arrays transactionally. Rebind
 	-- the saved preview records to those copied entries so the later identity
@@ -3565,6 +3610,12 @@ local function previewAndValidate()
 			preview.model.Name = string.format("AutoPipe_%03d_%s", index, entry.Name)
 		end
 		table.insert(State.authoredPlacementPreviews, preview)
+		if index % Config.PreviewRenderYieldEvery == 0 then
+			RunService.Heartbeat:Wait()
+			if State.destroyed or State.previewEpoch ~= previewEpoch then
+				return false, "Preview was cancelled because its source/settings changed."
+			end
+		end
 	end
 	createAuthoredLinkPreviews(folder)
 	createConnectionPreviews(folder)
@@ -3589,6 +3640,22 @@ local function previewAndValidate()
 		return false
 	end
 	return valid
+end
+
+local function previewAndValidate()
+	if State.previewInProgress then
+		return false, "A blueprint preview is already being prepared."
+	end
+	State.previewInProgress = true
+	local ok, result, detail = pcall(Runtime.previewAndValidateCore)
+	State.previewInProgress = false
+	State.activePreviewEpoch = nil
+	if not ok then
+		warn(PREFIX .. "preview error: " .. tostring(result))
+		notify("Preview failed", tostring(result), 9)
+		return false, tostring(result)
+	end
+	return result, detail
 end
 
 local REMOTE_SPECS = {
@@ -6893,7 +6960,7 @@ local function routeHeuristic(x, z, goals)
 	return best
 end
 
-local function findPipePath(starts, goals, obstacles, reserved, availabilityCache)
+local function findPipePath(starts, goals, obstacles, reserved, availabilityCache, expectedPreviewEpoch)
 	availabilityCache = availabilityCache or {}
 	local goalCells = {}
 	local minimumX = math.huge
@@ -6945,6 +7012,14 @@ local function findPipePath(starts, goals, obstacles, reserved, availabilityCach
 		visited += 1
 		if visited > Config.AutoPlumbMaxVisited then
 			return nil, string.format("route search exceeded %d cells", Config.AutoPlumbMaxVisited)
+		end
+		if visited % Config.AutoPlumbSearchYieldEvery == 0 then
+			RunService.Heartbeat:Wait()
+			if State.destroyed
+				or (expectedPreviewEpoch ~= nil and State.previewEpoch ~= expectedPreviewEpoch)
+			then
+				return nil, "route search cancelled because Preview changed or the script was destroyed"
+			end
 		end
 		if goalCells[routeCellKey(current.x, current.z)] then
 			local path = {}
@@ -7455,7 +7530,8 @@ generateAutoPlumbing = function()
 				{ pair.goal },
 				obstacles,
 				reserved,
-				availabilityCache
+				availabilityCache,
+				State.activePreviewEpoch
 			)
 			if not path then
 				continue
@@ -8689,6 +8765,144 @@ local function loadGameFromJSON(requestedName, silent)
 	end)
 end
 
+function Runtime.ensureConnectionDecorationRegistry()
+	local current = State.connectionDecorationRegistry
+	if current and not current.released then
+		return current
+	end
+	local registry = {
+		byName = {
+			Pipe = { list = {}, set = {}, dirty = false },
+			Power = { list = {}, set = {}, dirty = false },
+		},
+		connections = {},
+		childConnections = {},
+		memberName = {},
+		released = false,
+	}
+	State.connectionDecorationRegistry = registry
+	local function removeMembership(decoration)
+		local priorName = registry.memberName[decoration]
+		local priorBucket = priorName and registry.byName[priorName]
+		if priorBucket and priorBucket.set[decoration] then
+			priorBucket.set[decoration] = nil
+			priorBucket.dirty = true
+		end
+		registry.memberName[decoration] = nil
+	end
+	local function classify(decoration)
+		if registry.released then
+			return
+		end
+		local nextName = decoration:IsA("BasePart")
+			and decoration.Parent == ConnectionDecorations
+			and registry.byName[decoration.Name]
+			and decoration.Name
+			or nil
+		local priorName = registry.memberName[decoration]
+		if priorName == nextName then
+			return
+		end
+		removeMembership(decoration)
+		if nextName then
+			local nextBucket = registry.byName[nextName]
+			if not nextBucket.set[decoration] then
+				nextBucket.set[decoration] = true
+				table.insert(nextBucket.list, decoration)
+			end
+			registry.memberName[decoration] = nextName
+		end
+	end
+	local function untrack(decoration)
+		removeMembership(decoration)
+		local connection = registry.childConnections[decoration]
+		if connection then
+			connection:Disconnect()
+			registry.childConnections[decoration] = nil
+		end
+	end
+	local function track(decoration)
+		if registry.released or not decoration:IsA("BasePart") then
+			return
+		end
+		if not registry.childConnections[decoration] then
+			registry.childConnections[decoration] = decoration
+				:GetPropertyChangedSignal("Name")
+				:Connect(function()
+					classify(decoration)
+				end)
+		end
+		classify(decoration)
+	end
+	for _, decoration in ipairs(ConnectionDecorations:GetChildren()) do
+		track(decoration)
+	end
+	table.insert(registry.connections, ConnectionDecorations.ChildAdded:Connect(track))
+	table.insert(registry.connections, ConnectionDecorations.ChildRemoved:Connect(untrack))
+	return registry
+end
+
+function Runtime.connectionDecorationChildren(expectedName)
+	local registry = Runtime.ensureConnectionDecorationRegistry()
+	local bucket = registry.byName[expectedName]
+	if not bucket then
+		return {}
+	end
+	local needsCompact = bucket.dirty
+	if not needsCompact then
+		for _, decoration in ipairs(bucket.list) do
+			if not bucket.set[decoration]
+				or decoration.Parent ~= ConnectionDecorations
+				or decoration.Name ~= expectedName
+			then
+				needsCompact = true
+				break
+			end
+		end
+	end
+	if needsCompact then
+		local compacted = {}
+		local compactedSet = {}
+		for _, decoration in ipairs(bucket.list) do
+			if bucket.set[decoration]
+				and decoration.Parent == ConnectionDecorations
+				and decoration.Name == expectedName
+				and decoration:IsA("BasePart")
+			then
+				compactedSet[decoration] = true
+				table.insert(compacted, decoration)
+			end
+		end
+		bucket.list = compacted
+		bucket.set = compactedSet
+		bucket.dirty = false
+	end
+	return bucket.list
+end
+
+function Runtime.releaseConnectionDecorationRegistry()
+	local registry = State.connectionDecorationRegistry
+	if not registry then
+		return
+	end
+	registry.released = true
+	for _, connection in ipairs(registry.connections) do
+		pcall(function()
+			connection:Disconnect()
+		end)
+	end
+	for decoration, connection in pairs(registry.childConnections) do
+		pcall(function()
+			connection:Disconnect()
+		end)
+		registry.childConnections[decoration] = nil
+	end
+	registry.connections = {}
+	registry.memberName = {}
+	registry.byName = {}
+	State.connectionDecorationRegistry = nil
+end
+
 function Runtime.stopConnectionWatch(watch)
 	if not watch then
 		return
@@ -8707,21 +8921,23 @@ function Runtime.stopConnectionWatch(watch)
 end
 
 function Runtime.beginConnectionWatch(kind)
+	local expectedName = kind == "Pipe" and "Pipe" or "Power"
 	local watch = {
-		expectedName = kind == "Pipe" and "Pipe" or "Power",
+		expectedName = expectedName,
 		added = {},
 		seen = {},
 		baseline = {},
 		connection = nil,
 		stopped = false,
 	}
-	for _, decoration in ipairs(ConnectionDecorations:GetChildren()) do
+	for _, decoration in ipairs(Runtime.connectionDecorationChildren(expectedName)) do
 		watch.baseline[decoration] = true
 	end
 	State.activeConnectionWatches[watch] = true
 	local function consider(decoration)
 		if not watch.stopped
 			and decoration:IsA("BasePart")
+			and decoration.Name == expectedName
 			and not watch.baseline[decoration]
 			and not watch.seen[decoration]
 		then
@@ -8896,7 +9112,7 @@ function Runtime.findExactLiveConnectionDecorations(
 	local connectorDistance = (fromConnector.Position - toConnector.Position).Magnitude
 	local segments = {}
 	local caps = {}
-	for _, decoration in ipairs(ConnectionDecorations:GetChildren()) do
+	for _, decoration in ipairs(Runtime.connectionDecorationChildren(expectedName)) do
 		if decoration:IsA("BasePart")
 			and decoration.Name == expectedName
 			and decoration.Parent
@@ -9093,7 +9309,7 @@ local function verifyNewConnection(watch, connection, fromConnector, toConnector
 	}
 
 	local function authoritativeRefresh()
-		for _, decoration in ipairs(ConnectionDecorations:GetChildren()) do
+		for _, decoration in ipairs(Runtime.connectionDecorationChildren(watch.expectedName)) do
 			watch.consider(decoration)
 		end
 	end
@@ -9314,7 +9530,7 @@ function Runtime.invokeAndVerifyConnection(
 		Runtime.stopConnectionWatch(watch)
 		return nil, Runtime.buildCancellationReason()
 	end
-	for _, decoration in ipairs(ConnectionDecorations:GetChildren()) do
+	for _, decoration in ipairs(Runtime.connectionDecorationChildren(watch.expectedName)) do
 		watch.consider(decoration)
 	end
 	-- Since no request has been sent yet, a complete exact edge is safe to adopt
@@ -9714,6 +9930,51 @@ function Runtime.runBlueprintBuild()
 		end
 	end
 
+	-- Electrical endpoints can only reference Machines, never authored plumbing
+	-- Pieces. Commit and verify wires immediately after the machine stage so a
+	-- later strict pipe failure does not discard otherwise-valid electrical work;
+	-- Resume will audit and skip every wire already proven on the server.
+	if not failure then
+		local committedOK, committedError = Runtime.auditCommittedBlueprintPlacements()
+		if not committedOK then
+			failure = "pre-wiring placement audit failed: " .. tostring(committedError)
+		end
+	end
+
+	if not failure then
+		for _, connection in ipairs(State.connectionPreviews) do
+			if State.cancelRequested then
+				failure = Runtime.buildCancellationReason()
+				break
+			end
+			if connection.built then
+				continue
+			end
+			local actionStartedAt = os.clock()
+			local connected, connectionError = buildWireConnection(connection)
+			if not connected then
+				failure = connectionLabel(connection) .. " " .. connectionError
+				break
+			end
+			completedWires += 1
+			if Runtime.shouldReportResumedProgress(
+				priorWires,
+				completedWires,
+				#State.connectionPreviews
+			) then
+				Runtime.reportBuildProgress(
+					"Wires",
+					priorWires + completedWires,
+					#State.connectionPreviews
+				)
+			end
+			if not Runtime.waitForNextAction(Config.ConnectionDelay, actionStartedAt) then
+				failure = Runtime.buildCancellationReason()
+				break
+			end
+		end
+	end
+
 	if not failure then
 		for _, preview in ipairs(State.authoredPlacementPreviews) do
 			if State.cancelRequested then
@@ -9893,47 +10154,6 @@ function Runtime.runBlueprintBuild()
 	if not failure then
 		local committedOK, committedError = Runtime.auditCommittedBlueprintPlacements()
 		if not committedOK then
-			failure = "pre-wiring placement audit failed: " .. tostring(committedError)
-		end
-	end
-
-	if not failure then
-		for _, connection in ipairs(State.connectionPreviews) do
-			if State.cancelRequested then
-				failure = Runtime.buildCancellationReason()
-				break
-			end
-			if connection.built then
-				continue
-			end
-			local actionStartedAt = os.clock()
-			local connected, connectionError = buildWireConnection(connection)
-			if not connected then
-				failure = connectionLabel(connection) .. " " .. connectionError
-				break
-			end
-			completedWires += 1
-			if Runtime.shouldReportResumedProgress(
-				priorWires,
-				completedWires,
-				#State.connectionPreviews
-			) then
-				Runtime.reportBuildProgress(
-					"Wires",
-					priorWires + completedWires,
-					#State.connectionPreviews
-				)
-			end
-			if not Runtime.waitForNextAction(Config.ConnectionDelay, actionStartedAt) then
-				failure = Runtime.buildCancellationReason()
-				break
-			end
-		end
-	end
-
-	if not failure then
-		local committedOK, committedError = Runtime.auditCommittedBlueprintPlacements()
-		if not committedOK then
 			failure = "final placement audit failed: " .. tostring(committedError)
 		end
 	end
@@ -10003,7 +10223,11 @@ function Runtime.runBlueprintBuild()
 end
 
 local function buildBlueprint()
-	if State.autoFitInProgress then
+	if State.previewInProgress then
+		local message = "Wait for the active Preview to finish before building."
+		notify("Build waiting", message, 6)
+		return false, message
+	elseif State.autoFitInProgress then
 		local message = Runtime.autoFitBusyReason()
 		notify("Build waiting", message, 6)
 		return false, message
@@ -10348,6 +10572,54 @@ function Runtime.connectorPathInModel(model, connector)
 		table.insert(path, reversed[index])
 	end
 	return path
+end
+
+function Runtime.connectionConnectorRecords(model, kind)
+	if not model or not model.Parent or (kind ~= "Pipe" and kind ~= "Wire") then
+		return {}
+	end
+	local cache = State.connectionConnectorCache
+	local modelCache = cache[model]
+	if not modelCache then
+		modelCache = {}
+		cache[model] = modelCache
+	end
+	local cached = modelCache[kind]
+	if cached then
+		for _, record in ipairs(cached) do
+			local connector = record.connector
+			if not connector.Parent or not connector:IsDescendantOf(model) then
+				modelCache[kind] = nil
+				cached = nil
+				break
+			end
+		end
+	end
+	if cached then
+		return cached, true
+	end
+
+	local folderName = kind == "Pipe" and "Pipe" or "Power"
+	local records = {}
+	for _, descendant in ipairs(model:GetDescendants()) do
+		if descendant:IsA("BasePart") then
+			local metadata = descendant:FindFirstChild(folderName)
+			if metadata and metadata:IsA("Folder")
+				and Runtime.placedRootFromTarget(descendant) == model
+			then
+				local path = Runtime.connectorPathInModel(model, descendant)
+				if path then
+					table.insert(records, {
+						connector = descendant,
+						metadata = metadata,
+						path = path,
+					})
+				end
+			end
+		end
+	end
+	modelCache[kind] = records
+	return records, false
 end
 
 function Runtime.resolveConnectorPath(model, path)
@@ -11000,7 +11272,10 @@ function Runtime.addDuplicateSelection(model, base, bulk)
 	if autoFitBusy then
 		return false, autoFitBusy
 	end
-	local auditLockReason = not bulk and Runtime.duplicateAuditLockReason() or nil
+	-- Bulk marquee commits are just as selection-sensitive as single clicks. The
+	-- marquee already batches preview invalidation and versioning, but it must
+	-- never append objects while a yielded connection audit owns its snapshot.
+	local auditLockReason = Runtime.duplicateAuditLockReason()
 	if auditLockReason then
 		return false, auditLockReason
 	end
@@ -12174,13 +12449,20 @@ function Runtime.recoverLivePipeConnections(selectedByModel)
 
 	local connectorBuckets = {}
 	local connectorRecords = {}
+	local uncachedModels = 0
 	for _, model in ipairs(models) do
-		for _, descendant in ipairs(model:GetDescendants()) do
-			local metadata = descendant:IsA("BasePart") and descendant:FindFirstChild("Pipe")
-			if metadata and metadata:IsA("Folder") then
-				local root = Runtime.placedRootFromTarget(descendant)
-				if root == model then
-					local path = Runtime.connectorPathInModel(model, descendant)
+		local inventory, wasCached = Runtime.connectionConnectorRecords(model, "Pipe")
+		if not wasCached then
+			uncachedModels += 1
+			if uncachedModels % Config.ConnectionRecoveryModelYieldEvery == 0 then
+				RunService.Heartbeat:Wait()
+			end
+		end
+		for _, cachedConnector in ipairs(inventory) do
+			local descendant = cachedConnector.connector
+			local metadata = cachedConnector.metadata
+			if descendant.Parent and metadata and metadata.Parent == descendant then
+					local path = cachedConnector.path
 					local selectedIndex = selectedByModel[model]
 					local pathValid = path ~= nil
 					if selectedIndex and pathValid then
@@ -12213,7 +12495,6 @@ function Runtime.recoverLivePipeConnections(selectedByModel)
 					if selectedIndex then
 						recovery.SelectedConnectorCount += 1
 					end
-				end
 			end
 		end
 	end
@@ -12223,7 +12504,7 @@ function Runtime.recoverLivePipeConnections(selectedByModel)
 	local otherRecords = {}
 	local capBuckets = {}
 	local decorationSnapshots = {}
-	for _, decoration in ipairs(ConnectionDecorations:GetChildren()) do
+	for _, decoration in ipairs(Runtime.connectionDecorationChildren("Pipe")) do
 		if decoration:IsA("BasePart") and decoration.Name == "Pipe" then
 			local record = {
 				decoration = decoration,
@@ -12512,7 +12793,7 @@ function Runtime.recoverLivePipeConnections(selectedByModel)
 			end
 		end
 		local currentDecorationCount = 0
-		for _, decoration in ipairs(ConnectionDecorations:GetChildren()) do
+		for _, decoration in ipairs(Runtime.connectionDecorationChildren("Pipe")) do
 			if decoration:IsA("BasePart") and decoration.Name == "Pipe" then
 				currentDecorationCount += 1
 				local snapshot = decorationSnapshots[decoration]
@@ -12895,7 +13176,7 @@ function Runtime.recoverLivePipeConnections(selectedByModel)
 	end
 
 	local currentCount = 0
-	for _, decoration in ipairs(ConnectionDecorations:GetChildren()) do
+	for _, decoration in ipairs(Runtime.connectionDecorationChildren("Pipe")) do
 		if decoration:IsA("BasePart") and decoration.Name == "Pipe" then
 			currentCount += 1
 			local snapshot = decorationSnapshots[decoration]
@@ -13095,13 +13376,20 @@ function Runtime.recoverLiveWireConnections(selectedByModel)
 
 	local connectorBuckets = {}
 	local connectorRecords = {}
+	local uncachedModels = 0
 	for _, model in ipairs(models) do
-		for _, descendant in ipairs(model:GetDescendants()) do
-			local metadata = descendant:IsA("BasePart") and descendant:FindFirstChild("Power")
-			if metadata and metadata:IsA("Folder") then
-				local root = Runtime.placedRootFromTarget(descendant)
-				if root == model then
-					local path = Runtime.connectorPathInModel(model, descendant)
+		local inventory, wasCached = Runtime.connectionConnectorRecords(model, "Wire")
+		if not wasCached then
+			uncachedModels += 1
+			if uncachedModels % Config.ConnectionRecoveryModelYieldEvery == 0 then
+				RunService.Heartbeat:Wait()
+			end
+		end
+		for _, cachedConnector in ipairs(inventory) do
+			local descendant = cachedConnector.connector
+			local metadata = cachedConnector.metadata
+			if descendant.Parent and metadata and metadata.Parent == descendant then
+					local path = cachedConnector.path
 					local selectedIndex = selectedByModel[model]
 					local pathValid = path ~= nil
 					if selectedIndex and pathValid then
@@ -13133,7 +13421,6 @@ function Runtime.recoverLiveWireConnections(selectedByModel)
 					if selectedIndex then
 						recovery.SelectedConnectorCount += 1
 					end
-				end
 			end
 		end
 	end
@@ -13143,7 +13430,7 @@ function Runtime.recoverLiveWireConnections(selectedByModel)
 	local otherRecords = {}
 	local capBuckets = {}
 	local decorationSnapshots = {}
-	for _, decoration in ipairs(ConnectionDecorations:GetChildren()) do
+	for _, decoration in ipairs(Runtime.connectionDecorationChildren("Power")) do
 		if decoration:IsA("BasePart") and decoration.Name == "Power" then
 			local record = {
 				decoration = decoration,
@@ -13506,7 +13793,7 @@ function Runtime.recoverLiveWireConnections(selectedByModel)
 	end
 
 	local currentCount = 0
-	for _, decoration in ipairs(ConnectionDecorations:GetChildren()) do
+	for _, decoration in ipairs(Runtime.connectionDecorationChildren("Power")) do
 		if decoration:IsA("BasePart") and decoration.Name == "Power" then
 			currentCount += 1
 			local snapshot = decorationSnapshots[decoration]
@@ -13847,23 +14134,34 @@ function Runtime.createDuplicateConnectionPlans(folder)
 				rememberedIncidentConnections.Wire
 			)
 			or nil
-	local useLiveDecorationManifest = livePipeRecovery ~= nil
-	local useLiveWireDecorationManifest = liveWireRecovery ~= nil
+	local livePipeRecoveryAttempted = livePipeRecovery ~= nil
+	local liveWireRecoveryAttempted = liveWireRecovery ~= nil
+	-- A recovery table also carries exact failure diagnostics. It is a manifest
+	-- only when the two-frame scan explicitly proved itself authoritative; a
+	-- failed table must not suppress the pasted graph or still-observed registry.
+	local useLiveDecorationManifest = livePipeRecoveryAttempted
+		and livePipeRecovery.Authoritative == true
+	local useLiveWireDecorationManifest = liveWireRecoveryAttempted
+		and liveWireRecovery.Authoritative == true
 	local useLivePipeRegistryManifest = not useLiveDecorationManifest
 		and registryPipeManifestAvailable
-	local useLiveWireRegistryManifest = not useLiveWireDecorationManifest
+	-- Historical completeness is usable only when no current live inspection was
+	-- possible. Once a live scan runs, a failed/ambiguous result must stay
+	-- fail-closed; an older registry cannot prove that no manual wire was added.
+	local useLiveWireRegistryManifest = not liveWireRecoveryAttempted
+		and not useLiveWireDecorationManifest
 		and registryWireManifestAvailable
 	local recoveredMapping
 	local recoveryDetail
 	if not useLivePipeRegistryManifest or not useLiveWireRegistryManifest then
 		local graphDetail
 		recoveredMapping, graphDetail = Runtime.mapDuplicateSelectionToGraph()
-		if useLiveDecorationManifest or useLiveWireDecorationManifest then
+		if livePipeRecoveryAttempted or liveWireRecoveryAttempted then
 			local liveDetails = {}
-			if useLiveDecorationManifest then
+			if livePipeRecoveryAttempted then
 				table.insert(liveDetails, "pipes: " .. tostring(livePipeRecovery.Detail))
 			end
-			if useLiveWireDecorationManifest then
+			if liveWireRecoveryAttempted then
 				table.insert(liveDetails, "wires: " .. tostring(liveWireRecovery.Detail))
 			end
 			recoveryDetail = table.concat(liveDetails, " • ")
@@ -13901,6 +14199,7 @@ function Runtime.createDuplicateConnectionPlans(folder)
 	local pipePlanCount = 0
 	local wirePlanCount = 0
 	local registryPlanCount = 0
+	local registryWirePlanCount = 0
 	local liveRecoveryPlanCount = 0
 	local liveWireRecoveryPlanCount = 0
 	local boundaryPipeLinks = 0
@@ -14165,7 +14464,14 @@ function Runtime.createDuplicateConnectionPlans(folder)
 				and useLivePipeRegistryManifest
 				or known.kind == "Wire"
 					and (useLiveWireRegistryManifest or useLiveWireDecorationManifest)
+			local failedLiveFamilyCanUseExactRegistry = known.kind == "Pipe"
+				and livePipeRecoveryAttempted
+				and not useLiveDecorationManifest
+				or known.kind == "Wire"
+					and liveWireRecoveryAttempted
+					and not useLiveWireDecorationManifest
 			local contributesToRecoveredGraph = hasPreferredLiveManifest
+				or failedLiveFamilyCanUseExactRegistry
 				or not recoveredMapping
 				or (graphFamilyKey
 					and (genericPlanByKey[graphFamilyKey] or exactFamilySeen[graphFamilyKey]))
@@ -14187,6 +14493,9 @@ function Runtime.createDuplicateConnectionPlans(folder)
 					}
 				) then
 				registryPlanCount += 1
+				if known.kind == "Wire" then
+					registryWirePlanCount += 1
+				end
 			end
 		end
 	end
@@ -14274,8 +14583,10 @@ function Runtime.createDuplicateConnectionPlans(folder)
 			and (liveWireRecovery.SelectedEdgeCount or 0)
 			or 0,
 		WireAuthoritative = wireManifestSourceIsAuthoritative,
+		RegistryWireFallbackAuthoritative = useLiveWireRegistryManifest,
 		SelectionManifestComplete = selectionHasCompleteManifest,
 		Registry = registryPlanCount,
+		RegistryWire = registryWirePlanCount,
 		UnknownRegistryConnections = unknownRegistryConnections,
 		VisibleConnectionLines = duplicate.previewConnectionLinesUsed,
 		BoundaryPipeLinks = boundaryPipeLinks,
@@ -14599,15 +14910,16 @@ function Runtime.duplicatePlumbingBlockReason(connectionStats, selectionCount)
 	if hasPipeScope and stats.Authoritative ~= true then
 		return "The exact live plumbing graph could not be proven. No connector was guessed; retry after the plot finishes loading."
 	end
+	local exactWireRegistryFallback = stats.RegistryWireFallbackAuthoritative == true
 	local ambiguousWire = tonumber(stats.AmbiguousWireDecorations) or 0
-	if ambiguousWire > 0 then
+	if ambiguousWire > 0 and not exactWireRegistryFallback then
 		return string.format(
 			"%d power-line segment(s) match multiple exact connector pairs. Nothing was guessed or exported.",
 			ambiguousWire
 		)
 	end
 	local unresolvedWire = tonumber(stats.UnresolvedWireDecorations) or 0
-	if unresolvedWire > 0 then
+	if unresolvedWire > 0 and not exactWireRegistryFallback then
 		local unmapped = tonumber(stats.UnmappedSelectedWireConnectors) or 0
 		local unmatchedSegments = tonumber(stats.UnmatchedWireSegments) or 0
 		local unclaimedCaps = tonumber(stats.UnclaimedWireCaps) or 0
@@ -15533,13 +15845,14 @@ function Runtime.validateDuplicatePreviews(existing)
 	return allValid
 end
 
-function Runtime.previewDuplicate(existing)
+function Runtime.previewDuplicateCore(existing)
 	if State.destroyed then
 		return false, "The script has been destroyed; execute it again to restart."
 	elseif State.building then
 		return false, "A placement build is currently running."
 	end
 	local duplicate = State.duplicate
+	local previewSelectionVersion = duplicate.selectionVersion
 	local auditLockReason = Runtime.duplicateAuditLockReason()
 	if auditLockReason then
 		return false, auditLockReason
@@ -15565,8 +15878,22 @@ function Runtime.previewDuplicate(existing)
 	duplicate.validated = false
 	for index, item in ipairs(duplicate.selected) do
 		table.insert(duplicate.previews, Runtime.createDuplicatePreview(index, item, folder))
+		if index % Config.PreviewRenderYieldEvery == 0 then
+			RunService.Heartbeat:Wait()
+			if State.destroyed or duplicate.selectionVersion ~= previewSelectionVersion then
+				return false, "Duplicate selection changed while the preview was rendering; press Preview again."
+			end
+		end
+	end
+	if duplicate.selectionVersion ~= previewSelectionVersion then
+		Runtime.clearDuplicatePreview(true, true)
+		return false, "Duplicate selection changed while the preview was rendering; press Preview again."
 	end
 	Runtime.createDuplicateConnectionPlans(folder)
+	if duplicate.selectionVersion ~= previewSelectionVersion then
+		Runtime.clearDuplicatePreview(true, true)
+		return false, "Duplicate selection changed while connections were being audited; press Preview again."
+	end
 	local valid = Runtime.validateDuplicatePreviews(existing)
 	local validationError
 	if valid then
@@ -15637,6 +15964,21 @@ function Runtime.previewDuplicate(existing)
 		end
 	end
 	return valid, validationError or (not valid and "Duplicate preview failed validation; inspect the red ghosts and console details." or nil)
+end
+
+function Runtime.previewDuplicate(existing)
+	local duplicate = State.duplicate
+	if duplicate.previewInProgress then
+		return false, "A duplicate preview is already being prepared."
+	end
+	duplicate.previewInProgress = true
+	local ok, result, detail = pcall(Runtime.previewDuplicateCore, existing)
+	duplicate.previewInProgress = false
+	if not ok then
+		warn(PREFIX .. "duplicate preview error: " .. tostring(result))
+		return false, tostring(result)
+	end
+	return result, detail
 end
 
 function Runtime.useMyPositionForDuplicate()
@@ -16279,7 +16621,18 @@ function Runtime.runDuplicateBuild()
 			end
 		end
 		if not failure then
-			for _, plan in ipairs(duplicate.connections) do
+			-- Electrical edges depend only on the verified destination machines. Send
+			-- them before physical pipe plugs so a later plumbing-specific server
+			-- rejection cannot prevent otherwise valid wiring from being committed.
+			local orderedConnections = {}
+			for _, wantedKind in ipairs({ "Wire", "Pipe" }) do
+				for _, plan in ipairs(duplicate.connections) do
+					if plan.kind == wantedKind then
+						table.insert(orderedConnections, plan)
+					end
+				end
+			end
+			for _, plan in ipairs(orderedConnections) do
 				if State.cancelRequested then
 					failure = Runtime.buildCancellationReason()
 					break
@@ -16592,6 +16945,7 @@ local API = {
 	end,
 	CancelActiveWatches = Runtime.stopAllBuildWatches,
 	ReleasePlacedRegistry = Runtime.releasePlacedRegistry,
+	ReleaseConnectionDecorationRegistry = Runtime.releaseConnectionDecorationRegistry,
 }
 
 function API.SetOrigin(x, z)
@@ -16928,6 +17282,9 @@ if type(previousAPI) == "table" then
 	if type(previousAPI.ReleasePlacedRegistry) == "function" then
 		pcall(previousAPI.ReleasePlacedRegistry)
 	end
+	if type(previousAPI.ReleaseConnectionDecorationRegistry) == "function" then
+		pcall(previousAPI.ReleaseConnectionDecorationRegistry)
+	end
 	if type(previousAPI.StopManualPlacement) == "function" then
 		pcall(previousAPI.StopManualPlacement, true)
 	end
@@ -16995,6 +17352,7 @@ function API.Destroy()
 	State.replaying = false
 	Runtime.stopAllBuildWatches()
 	Runtime.releasePlacedRegistry()
+	Runtime.releaseConnectionDecorationRegistry()
 	local captureController = environment.__IndustrialistBlueprintCaptureController
 	if type(captureController) == "table" and captureController.State == State then
 		Runtime.disableCaptureController(captureController)
@@ -17035,6 +17393,7 @@ function API.Destroy()
 	-- after Destroy.
 	State.exactTemplateCache = {}
 	State.templateBaseTransformCache = setmetatable({}, { __mode = "k" })
+	State.connectionConnectorCache = setmetatable({}, { __mode = "k" })
 
 	local rayfield = State.rayfield or environment.Rayfield
 	local legacyInterface = environment.IndustrialistBlueprintUI
